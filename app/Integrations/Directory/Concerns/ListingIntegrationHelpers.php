@@ -49,6 +49,7 @@ trait ListingIntegrationHelpers {
     public function listings( ?ListingPaginatorDTO $listing_paginator, Request $request, array $fields = [] ): ListingPaginatorDTO {
         $page = $this->listing_query()->paginate( $request );
         _prime_post_caches( $page["ids"] );
+        $this->prime_listings( $page["ids"], $fields );
 
         $items = [];
         foreach ( $page["ids"] as $listing_id ) {
@@ -60,6 +61,15 @@ trait ListingIntegrationHelpers {
 
         return new ListingPaginatorDTO( $page["page"], $page["per_page"], $page["total"], $page["last_page"], $items );
     }
+
+    /**
+     * Bulk-load what a plugin keeps outside post meta and reads per listing (GeoDirectory's
+     * locations), so mapping a page of listings costs no query per listing.
+     *
+     * @param int[]    $listing_ids The listings about to be mapped.
+     * @param string[] $fields      The requested fields.
+     */
+    protected function prime_listings( array $listing_ids, array $fields ): void {}
 
     /**
      * Available listing filters for the current context.

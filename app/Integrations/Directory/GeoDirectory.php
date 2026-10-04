@@ -84,15 +84,67 @@ class GeoDirectory extends Provider {
     }
 
     public function locations( ?TermPaginatorDTO $location_paginator, Request $request, array $fields = [] ): TermPaginatorDTO {
-        return $this->empty_term_paginator( $request );
+        $store = $this->location_store();
+
+        if ( ! $store ) {
+            return $this->empty_term_paginator( $request );
+        }
+
+        $page     = (int) $request->get_param( "page" ) ?: 1;
+        $per_page = (int) $request->get_param( "per_page" ) ?: 10;
+        $cities   = $store->page(
+            sanitize_text_field( (string) $request->get_param( "search" ) ),
+            sanitize_text_field( (string) $request->get_param( "sort" ) ),
+            $per_page,
+            ( $page - 1 ) * $per_page
+        );
+
+        $images = $this->location_images( $store, $cities["items"], $fields );
+        $items  = [];
+
+        foreach ( $cities["items"] as $city ) {
+            $items[] = $this->map_city_to_dto( $city, $fields, (int) $city->post_count, $images[(int) $city->location_id] ?? [] );
+        }
+
+        return new TermPaginatorDTO( $page, $per_page, $cities["total"], max( 1, (int) ceil( $cities["total"] / $per_page ) ), $items );
     }
 
     public function location( ?TermDTO $location, Request $request, array $fields = [] ): ?TermDTO {
-        return null;
+        $store = $this->location_store();
+        $city  = $store ? $store->city( (int) craf_appna_route_param( $request, "id" ) ) : null;
+
+        if ( ! $city ) {
+            return null;
+        }
+
+        $images = $this->location_images( $store, [$city], $fields );
+        $count  = in_array( "count", $fields, true ) ? $store->count_for( $city ) : 0;
+
+        return $this->map_city_to_dto( $city, $fields, $count, $images[(int) $city->location_id] ?? [] );
+    }
+
+    protected function prime_listings( array $listing_ids, array $fields ): void {
+        $store = $this->location_store();
+
+        if ( $store && ! empty( $listing_ids ) && in_array( "locations", $fields, true ) ) {
+            $store->prime( $listing_ids );
+        }
     }
 
     protected function catalog(): ListingCatalog {
+        return $this->geodirectory_catalog();
+    }
+
+    private function geodirectory_catalog(): GeoDirectoryCatalog {
         return $this->catalog ??= new GeoDirectoryCatalog();
+    }
+
+    /**
+     * Where GeoDirectory's locations are, or null without the Location Manager add-on.
+     * The catalog's own instance, so the filter and these reads share its lookups.
+     */
+    private function location_store(): ?GeoDirectoryLocations {
+        return $this->geodirectory_catalog()->geodirectory_locations();
     }
 
     private function is_loaded(): bool {
@@ -161,11 +213,18 @@ class GeoDirectory extends Provider {
             ]
         );
 
-        $items = [];
+        $posts = [];
         foreach ( $query->posts as $post ) {
             if ( $post instanceof WP_Post ) {
-                $items[] = $this->map_listing_to_dto( $post, $fields );
+                $posts[] = $post;
             }
+        }
+
+        $this->prime_listings( array_map( fn( WP_Post $post ): int => (int) $post->ID, $posts ), $fields );
+
+        $items = [];
+        foreach ( $posts as $post ) {
+            $items[] = $this->map_listing_to_dto( $post, $fields );
         }
 
         return new ListingPaginatorDTO( $page, $per_page, (int) $query->found_posts, max( 1, (int) $query->max_num_pages ), $items );
@@ -242,7 +301,7 @@ class GeoDirectory extends Provider {
             $dto->set_categories( $this->get_listing_terms( $post->ID, $this->category_taxonomy() ) );
         }
         if ( in_array( "locations", $fields, true ) ) {
-            $dto->set_locations( [] );
+            $dto->set_locations( $this->get_listing_locations( (int) $post->ID ) );
         }
         if ( in_array( "tags", $fields, true ) ) {
             $dto->set_tags( $this->get_listing_terms( $post->ID, $this->tag_taxonomy() ) );
@@ -537,6 +596,86 @@ class GeoDirectory extends Provider {
         }
 
         return $dto;
+    }
+
+    private function map_city_to_dto( object $city, array $fields, int $count, array $image ): TermDTO {
+        $dto = new TermDTO();
+
+        if ( in_array( "id", $fields, true ) ) {
+            $dto->set_id( (int) $city->location_id );
+        }
+        if ( in_array( "name", $fields, true ) ) {
+            $dto->set_name( (string) $city->city );
+        }
+        if ( in_array( "slug", $fields, true ) ) {
+            $dto->set_slug( (string) $city->city_slug );
+        }
+        if ( in_array( "count", $fields, true ) ) {
+            $dto->set_count( $count );
+        }
+        if ( in_array( "image", $fields, true ) ) {
+            $dto->set_image( $image );
+        }
+
+        return $dto;
+    }
+
+    /**
+     * The image of each of these cities, by location id: the one Location Manager keeps for
+     * it, or else an image from a listing in that city. That fallback is what Location
+     * Manager's own location pages do, a city image being optional and rarely set.
+     *
+     * @param object[] $cities
+     * @return array<int, array>
+     */
+    private function location_images( GeoDirectoryLocations $store, array $cities, array $fields ): array {
+        if ( ! in_array( "image", $fields, true ) || empty( $cities ) ) {
+            return [];
+        }
+
+        $images = [];
+        foreach ( $store->image_values( $cities ) as $location_id => $value ) {
+            $image = $this->normalize_image_value( $value );
+            if ( $image ) {
+                $images[ (int) $location_id ] = $image;
+            }
+        }
+
+        $without = array_values( array_filter( $cities, fn( $city ): bool => empty( $images[ (int) $city->location_id ] ) ) );
+        $listings = $without ? $store->listing_ids( $without ) : [];
+
+        if ( empty( $listings ) ) {
+            return $images;
+        }
+
+        // The listing images are read post by post, so prime their meta for the whole page.
+        _prime_post_caches( array_values( array_unique( $listings ) ), false, true );
+
+        foreach ( $listings as $location_id => $listing_id ) {
+            $image = $this->get_listing_image( (int) $listing_id );
+            if ( $image ) {
+                $images[ (int) $location_id ] = $image;
+            }
+        }
+
+        return $images;
+    }
+
+    /**
+     * A listing's city, shaped like its categories and tags. None or one: a GeoDirectory
+     * listing sits in exactly one city.
+     */
+    private function get_listing_locations( int $listing_id ): array {
+        $store = $this->location_store();
+        $city  = $store ? $store->city_for_post( $listing_id ) : null;
+
+        return $city ? [
+            [
+                "id"   => (int) $city->location_id,
+                "name" => (string) $city->city,
+                "slug" => (string) $city->city_slug,
+            ],
+        ] : [];
     }
 
     private function get_term_image( int $term_id, array $keys ): array {

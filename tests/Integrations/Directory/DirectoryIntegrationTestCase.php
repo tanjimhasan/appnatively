@@ -6,6 +6,7 @@ use Crafium\AppNatively\App\DTO\Directory\CategoryDTO;
 use Crafium\AppNatively\App\DTO\Directory\CategoryPaginatorDTO;
 use Crafium\AppNatively\App\DTO\Directory\ListingDTO;
 use Crafium\AppNatively\App\DTO\Directory\ListingPaginatorDTO;
+use Crafium\AppNatively\App\DTO\Directory\TermDTO;
 use Crafium\AppNatively\App\DTO\Directory\TermPaginatorDTO;
 use Crafium\AppNatively\App\DTO\Filter\FiltersDTO;
 use Crafium\AppNatively\WpMVC\RequestValidator\Request;
@@ -50,8 +51,8 @@ abstract class DirectoryIntegrationTestCase extends \WP_UnitTestCase {
         );
     }
 
-    protected function create_term( string $taxonomy, string $name ): int {
-        $term = wp_insert_term( $name, $taxonomy );
+    protected function create_term( string $taxonomy, string $name, int $parent = 0 ): int {
+        $term = wp_insert_term( $name, $taxonomy, $parent > 0 ? ["parent" => $parent] : [] );
 
         if ( is_wp_error( $term ) ) {
             $existing = get_term_by( "name", $name, $taxonomy );
@@ -94,6 +95,23 @@ abstract class DirectoryIntegrationTestCase extends \WP_UnitTestCase {
 
     protected function assign_terms( int $post_id, string $taxonomy, array $term_ids ): void {
         wp_set_object_terms( $post_id, array_map( "intval", $term_ids ), $taxonomy );
+    }
+
+    /**
+     * The listing ids a listings request returns, in order.
+     *
+     * @param array $params Request params besides the integration.
+     * @return int[]
+     */
+    protected function listing_ids_for( string $integration, array $params ): array {
+        $paginator = apply_filters(
+            "craf_appna_directory_{$integration}_listings",
+            null,
+            $this->create_request( array_merge( ["integration" => $integration], $params ) ),
+            $this->listing_fields()
+        );
+
+        return array_map( fn( $listing ): int => $listing->get_id(), $paginator->get_items() );
     }
 
     protected function create_request( array $params = [] ): Request {
@@ -262,6 +280,52 @@ abstract class DirectoryIntegrationTestCase extends \WP_UnitTestCase {
         $paginator = apply_filters( "craf_appna_directory_{$integration}_tags", null, $request, $this->term_fields() );
 
         $this->assertInstanceOf( TermPaginatorDTO::class, $paginator );
+    }
+
+    /**
+     * The locations endpoint answers with a term paginator, and lists the expected location
+     * when one is given. Pass no id for an integration whose locations are optional.
+     */
+    protected function assert_location_collection( string $integration, int $expected_id = 0, string $expected_slug = "" ): void {
+        $request = $this->create_request(
+            [
+                "page"        => 1,
+                "per_page"    => 100,
+                "integration" => $integration,
+            ]
+        );
+
+        $paginator = apply_filters( "craf_appna_directory_{$integration}_locations", null, $request, $this->term_fields() );
+
+        $this->assertInstanceOf( TermPaginatorDTO::class, $paginator );
+
+        if ( $expected_id > 0 ) {
+            $items = [];
+            foreach ( $paginator->get_items() as $item ) {
+                $items[$item->get_id()] = $item;
+            }
+
+            $this->assertArrayHasKey( $expected_id, $items );
+
+            if ( "" !== $expected_slug ) {
+                $this->assertSame( $expected_slug, $items[$expected_id]->get_slug() );
+            }
+        }
+    }
+
+    protected function assert_single_location( string $integration, int $location_id, string $name ): void {
+        $request = $this->create_request(
+            [
+                "id"          => $location_id,
+                "integration" => $integration,
+            ]
+        );
+
+        $location = apply_filters( "craf_appna_directory_{$integration}_location", null, $request, $this->term_fields() );
+
+        $this->assertInstanceOf( TermDTO::class, $location );
+        $this->assertSame( $location_id, $location->get_id() );
+        $this->assertSame( $name, $location->get_name() );
     }
 
     protected function assert_review_payload( string $integration, int $listing_id ): void {

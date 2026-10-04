@@ -76,6 +76,8 @@ class ClassifiedListingTest extends DirectoryIntegrationTestCase {
         $this->assert_related_listings( $this->integration, $source_id, $related_id );
         $this->assert_categories( $this->integration, $category_id );
         $this->assert_tag_collection( $this->integration );
+        $this->assert_location_collection( $this->integration, $location_id, get_term_field( "slug", $location_id, $this->location_taxonomy ) );
+        $this->assert_single_location( $this->integration, $location_id, "Classified Listing Location" );
         $this->assert_review_payload( $this->integration, $source_id );
     }
 }

@@ -22,7 +22,7 @@ class HivePressCatalog extends ListingCatalog {
     ];
 
     /** Attributes the catalog reads itself, never offered as custom fields. */
-    private const CORE_ATTRIBUTES = [ 'price', 'featured', 'rating', 'latitude', 'longitude', 'location' ];
+    private const CORE_ATTRIBUTES = [ 'price', 'featured', 'rating', 'latitude', 'longitude', 'location', 'region' ];
 
     /** @var array<string, array>|null Listing attributes by name (see attributes()). */
     private ?array $attributes = null;

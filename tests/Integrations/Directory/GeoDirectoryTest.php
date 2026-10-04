@@ -13,6 +13,9 @@ class GeoDirectoryTest extends DirectoryIntegrationTestCase {
 
     private string $tag_taxonomy = "gd_place_tags";
 
+    /** @var int[] Location Manager rows this test inserted. */
+    private array $created_location_ids = [];
+
     public function setUp(): void {
         parent::setUp();
 
@@ -59,6 +62,240 @@ class GeoDirectoryTest extends DirectoryIntegrationTestCase {
         $this->assert_categories( $this->integration, $category_id );
         $this->assert_tag_collection( $this->integration );
         $this->assert_review_payload( $this->integration, $source_id );
+    }
+
+    public function test_geodirectory_locations_use_the_location_manager_tables(): void {
+        $location_id = $this->create_geodirectory_city( "Dhaka", "Dhaka Division", "Bangladesh" );
+
+        if ( 0 === $location_id ) {
+            $this->markTestSkipped( "GeoDirectory Location Manager is not active." );
+        }
+
+        $in_city_id = $this->create_listing( $this->post_type, "GeoDirectory In Dhaka" );
+        $elsewhere  = $this->create_listing( $this->post_type, "GeoDirectory Nowhere" );
+
+        if ( ! $this->set_geodirectory_listing_city( $in_city_id, "Dhaka", "Dhaka Division", "Bangladesh" ) ) {
+            $this->markTestSkipped( "GeoDirectory did not store listing detail rows." );
+        }
+        $this->set_geodirectory_listing_city( $elsewhere, "", "", "" );
+
+        // The locations endpoints.
+        $this->assert_location_collection( $this->integration, $location_id, "dhaka" );
+        $this->assert_single_location( $this->integration, $location_id, "Dhaka" );
+
+        $locations = apply_filters(
+            "craf_appna_directory_{$this->integration}_locations",
+            null,
+            $this->create_request( ["page" => 1, "per_page" => 100, "integration" => $this->integration] ),
+            $this->term_fields()
+        );
+        $this->assertSame( 1, $locations->get_items()[0]->get_count() );
+
+        // The page context narrows by location id.
+        $this->assertSame( [$in_city_id], $this->listing_ids_for( $this->integration, ["locations" => [$location_id]] ) );
+
+        // The filter facet offers the city by slug, with its count.
+        $filters = apply_filters(
+            "craf_appna_directory_{$this->integration}_listings_filters",
+            null,
+            $this->create_request( ["facets" => ["location"], "integration" => $this->integration] )
+        );
+        $facet = $filters->get_facets()[0];
+        $this->assertSame( "location", $facet->get_id() );
+        $this->assertSame( "Location", $facet->get_label() );
+        $this->assertCount( 1, $facet->get_options() );
+        $this->assertSame( "dhaka", $facet->get_options()[0]->get_value() );
+        $this->assertSame( "Dhaka", $facet->get_options()[0]->get_label() );
+        $this->assertSame( 1, $facet->get_options()[0]->get_count() );
+
+        // A selection narrows by that same slug.
+        $this->assertSame( [$in_city_id], $this->listing_ids_for( $this->integration, ["values" => ["location" => ["dhaka"]]] ) );
+
+        // And the listing carries its city.
+        $listing = apply_filters(
+            "craf_appna_directory_{$this->integration}_listing",
+            null,
+            $this->create_request( ["id" => $in_city_id, "integration" => $this->integration] ),
+            $this->listing_fields()
+        );
+        $this->assertSame(
+            [["id" => $location_id, "name" => "Dhaka", "slug" => "dhaka"]],
+            $listing->get_locations()
+        );
+    }
+
+    /**
+     * Cities sharing a slug are one filter option whose counts add up, and one selection
+     * matches them all, while the locations list keeps them apart.
+     */
+    public function test_geodirectory_merges_cities_that_share_a_slug(): void {
+        $first  = $this->create_geodirectory_city( "Springfield", "Illinois", "United States" );
+        $second = $this->create_geodirectory_city( "Springfield", "Missouri", "United States" );
+
+        if ( 0 === $first || 0 === $second ) {
+            $this->markTestSkipped( "GeoDirectory Location Manager is not active." );
+        }
+
+        $illinois_id = $this->create_listing( $this->post_type, "GeoDirectory Springfield IL" );
+        $missouri_id = $this->create_listing( $this->post_type, "GeoDirectory Springfield MO" );
+
+        if ( ! $this->set_geodirectory_listing_city( $illinois_id, "Springfield", "Illinois", "United States" ) ) {
+            $this->markTestSkipped( "GeoDirectory did not store listing detail rows." );
+        }
+        $this->set_geodirectory_listing_city( $missouri_id, "Springfield", "Missouri", "United States" );
+
+        $filters = apply_filters(
+            "craf_appna_directory_{$this->integration}_listings_filters",
+            null,
+            $this->create_request( ["facets" => ["location"], "integration" => $this->integration] )
+        );
+        $options = $filters->get_facets()[0]->get_options();
+
+        $this->assertCount( 1, $options );
+        $this->assertSame( "springfield", $options[0]->get_value() );
+        $this->assertSame( 2, $options[0]->get_count() );
+
+        $this->assertSame(
+            [$missouri_id, $illinois_id],
+            $this->listing_ids_for( $this->integration, ["values" => ["location" => ["springfield"]]] )
+        );
+
+        // Each city stays addressable on its own.
+        $this->assert_location_collection( $this->integration, $first, "springfield" );
+        $this->assert_location_collection( $this->integration, $second, "springfield" );
+        $this->assertSame( [$illinois_id], $this->listing_ids_for( $this->integration, ["locations" => [$first]] ) );
+    }
+
+    /**
+     * A city's image comes from the location SEO table, preferring the row that names the
+     * same country and region.
+     */
+    public function test_geodirectory_location_image_comes_from_the_seo_table(): void {
+        global $wpdb;
+
+        $location_id = $this->create_geodirectory_city( "Kyoto", "Kansai", "Japan" );
+
+        if ( 0 === $location_id || ! defined( "GEODIR_LOCATION_SEO_TABLE" ) ) {
+            $this->markTestSkipped( "GeoDirectory Location Manager is not active." );
+        }
+
+        $attachment_id = $this->factory->attachment->create_object(
+            [
+                "file"           => "kyoto.jpg",
+                "post_mime_type" => "image/jpeg",
+            ]
+        );
+
+        // A slug-only row first, then the one naming this city's country and region: the
+        // exact match must win however they are ordered by seo_id.
+        $wpdb->insert(
+            GEODIR_LOCATION_SEO_TABLE,
+            ["location_type" => "city", "country_slug" => "elsewhere", "region_slug" => "elsewhere", "city_slug" => "kyoto", "meta_title" => "", "meta_desc" => "", "image" => "0", "image_tagline" => "", "location_desc" => "", "cpt_desc" => ""],
+            ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s"]
+        );
+        $wpdb->insert(
+            GEODIR_LOCATION_SEO_TABLE,
+            ["location_type" => "city", "country_slug" => "japan", "region_slug" => "kansai", "city_slug" => "kyoto", "meta_title" => "", "meta_desc" => "", "image" => (string) $attachment_id, "image_tagline" => "", "location_desc" => "", "cpt_desc" => ""],
+            ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s"]
+        );
+
+        $location = apply_filters(
+            "craf_appna_directory_{$this->integration}_location",
+            null,
+            $this->create_request( ["id" => $location_id, "integration" => $this->integration] ),
+            $this->term_fields()
+        );
+
+        $this->assertSame( (int) $attachment_id, $location->get_image()["id"] );
+        $this->assertSame( wp_get_attachment_url( $attachment_id ), $location->get_image()["src"] );
+
+        $wpdb->delete( GEODIR_LOCATION_SEO_TABLE, ["city_slug" => "kyoto"], ["%s"] );
+    }
+
+    public function test_geodirectory_location_without_an_image_takes_one_from_its_listings(): void {
+        global $wpdb;
+
+        $location_id = $this->create_geodirectory_city( "Osaka", "Kansai", "Japan" );
+
+        if ( 0 === $location_id ) {
+            $this->markTestSkipped( "GeoDirectory Location Manager is not active." );
+        }
+
+        $listing_id = $this->create_listing( $this->post_type, "Osaka Listing" );
+        if ( ! $this->set_geodirectory_listing_city( $listing_id, "Osaka", "Kansai", "Japan" ) ) {
+            $this->markTestSkipped( "GeoDirectory did not create a detail row for the listing." );
+        }
+
+        $attachment_id = $this->factory->attachment->create_object(
+            [
+                "file"           => "osaka.jpg",
+                "post_mime_type" => "image/jpeg",
+            ]
+        );
+        set_post_thumbnail( $listing_id, $attachment_id );
+
+        $location = apply_filters(
+            "craf_appna_directory_{$this->integration}_location",
+            null,
+            $this->create_request( ["id" => $location_id, "integration" => $this->integration] ),
+            $this->term_fields()
+        );
+
+        // No row of its own in the SEO table, so the city borrows its listing's image.
+        $this->assertSame( (int) $attachment_id, $location->get_image()["id"] );
+        $this->assertSame( wp_get_attachment_url( $attachment_id ), $location->get_image()["src"] );
+
+        if ( ! defined( "GEODIR_LOCATION_SEO_TABLE" ) ) {
+            return;
+        }
+
+        $own_image_id = $this->factory->attachment->create_object(
+            [
+                "file"           => "osaka-city.jpg",
+                "post_mime_type" => "image/jpeg",
+            ]
+        );
+        $wpdb->insert(
+            GEODIR_LOCATION_SEO_TABLE,
+            ["location_type" => "city", "country_slug" => "japan", "region_slug" => "kansai", "city_slug" => "osaka", "meta_title" => "", "meta_desc" => "", "image" => (string) $own_image_id, "image_tagline" => "", "location_desc" => "", "cpt_desc" => ""],
+            ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s"]
+        );
+
+        $located = apply_filters(
+            "craf_appna_directory_{$this->integration}_location",
+            null,
+            $this->create_request( ["id" => $location_id, "integration" => $this->integration] ),
+            $this->term_fields()
+        );
+
+        // Its own image wins once it has one.
+        $this->assertSame( (int) $own_image_id, $located->get_image()["id"] );
+
+        $wpdb->delete( GEODIR_LOCATION_SEO_TABLE, ["city_slug" => "osaka"], ["%s"] );
+    }
+
+    public function test_geodirectory_locations_are_empty_without_the_location_manager(): void {
+        if ( defined( "GEODIR_LOCATIONS_TABLE" ) ) {
+            $this->markTestSkipped( "GeoDirectory Location Manager is active." );
+        }
+
+        $locations = apply_filters(
+            "craf_appna_directory_{$this->integration}_locations",
+            null,
+            $this->create_request( ["page" => 1, "per_page" => 10, "integration" => $this->integration] ),
+            $this->term_fields()
+        );
+
+        $this->assertSame( 0, $locations->get_total() );
+        $this->assertSame( [], $locations->get_items() );
+        $this->assertNull(
+            apply_filters(
+                "craf_appna_directory_{$this->integration}_location",
+                null,
+                $this->create_request( ["id" => 1, "integration" => $this->integration] ),
+                $this->term_fields()
+            )
+        );
     }
 
     public function test_geodirectory_reviews_read_ratings_from_review_table(): void {
@@ -156,6 +393,84 @@ class GeoDirectoryTest extends DirectoryIntegrationTestCase {
         $this->assertSame( ["Newest medium geo review", "Middle high geo review", "Old low geo review"], array_column( $newest["items"], "review" ) );
         $this->assertSame( [5.0, 3.0, 1.0], array_column( $highest["items"], "rating" ) );
         $this->assertSame( [1.0, 3.0, 5.0], array_column( $lowest["items"], "rating" ) );
+    }
+
+    /**
+     * Insert a Location Manager city.
+     *
+     * @return int Its location id, or 0 when the add-on is inactive.
+     */
+    private function create_geodirectory_city( string $city, string $region, string $country ): int {
+        global $wpdb;
+
+        if ( ! defined( "GEODIR_LOCATIONS_TABLE" ) ) {
+            return 0;
+        }
+
+        $wpdb->insert(
+            GEODIR_LOCATIONS_TABLE,
+            [
+                "country"      => $country,
+                "region"       => $region,
+                "city"         => $city,
+                "country_slug" => sanitize_title( $country ),
+                "region_slug"  => sanitize_title( $region ),
+                "city_slug"    => sanitize_title( $city ),
+                "latitude"     => "23.8103",
+                "longitude"    => "90.4125",
+                "is_default"   => 0,
+            ],
+            ["%s", "%s", "%s", "%s", "%s", "%s", "%s", "%s", "%d"]
+        );
+
+        $location_id                  = (int) $wpdb->insert_id;
+        $this->created_location_ids[] = $location_id;
+
+        return $location_id;
+    }
+
+    /**
+     * Put a listing in a city, creating its detail row when GeoDirectory's own save hooks
+     * did not.
+     *
+     * @return bool Whether the listing now has a detail row.
+     */
+    private function set_geodirectory_listing_city( int $post_id, string $city, string $region, string $country ): bool {
+        global $wpdb;
+
+        $table = $wpdb->prefix . "geodir_" . $this->post_type . "_detail";
+
+        //phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        if ( $wpdb->get_var( $wpdb->prepare( "SELECT post_id FROM {$table} WHERE post_id = %d", $post_id ) ) ) {
+            return false !== $wpdb->update( $table, ["city" => $city, "region" => $region, "country" => $country], ["post_id" => $post_id], ["%s", "%s", "%s"], ["%d"] );
+        }
+
+        return false !== $wpdb->insert(
+            $table,
+            [
+                "post_id"     => $post_id,
+                "post_title"  => get_the_title( $post_id ),
+                "post_status" => "publish",
+                "city"        => $city,
+                "region"      => $region,
+                "country"     => $country,
+            ],
+            ["%d", "%s", "%s", "%s", "%s", "%s"]
+        );
+    }
+
+    public function tearDown(): void {
+        global $wpdb;
+
+        if ( defined( "GEODIR_LOCATIONS_TABLE" ) ) {
+            foreach ( $this->created_location_ids as $location_id ) {
+                $wpdb->delete( GEODIR_LOCATIONS_TABLE, ["location_id" => $location_id], ["%d"] );
+            }
+        }
+
+        $this->created_location_ids = [];
+
+        parent::tearDown();
     }
 
     private function create_review( int $post_id, float $rating, string $content, string $date ): int {

@@ -5,6 +5,8 @@ namespace Crafium\AppNatively\App\Integrations\Directory\Catalog;
 defined( "ABSPATH" ) || exit;
 
 use Crafium\AppNatively\App\Filtering\Field;
+use Crafium\AppNatively\App\Filtering\TermSource;
+use Crafium\AppNatively\App\Integrations\Directory\GeoDirectoryLocations;
 use Crafium\AppNatively\WpMVC\Database\Query\Builder;
 
 /**
@@ -39,6 +41,10 @@ class GeoDirectoryCatalog extends ListingCatalog {
     /** @var array<string, Field>|null */
     private ?array $fields = null;
 
+    private ?GeoDirectoryLocations $locations = null;
+
+    private bool $locations_resolved = false;
+
     public function post_types(): array {
         if ( function_exists( 'geodir_get_posttypes' ) ) {
             $post_types = geodir_get_posttypes( 'array' );
@@ -55,6 +61,23 @@ class GeoDirectoryCatalog extends ListingCatalog {
 
     public function tag_taxonomy(): ?string {
         return $this->post_type() . '_tags';
+    }
+
+    public function location_source(): ?TermSource {
+        return $this->geodirectory_locations();
+    }
+
+    /**
+     * GeoDirectory's locations, or null without the Location Manager add-on that holds
+     * them. The same instance the provider reads its location DTOs from: it remembers
+     * the locations it looked up, so a listing page costs no query per listing.
+     */
+    public function geodirectory_locations(): ?GeoDirectoryLocations {
+        if ( ! $this->locations_resolved ) {
+            $this->locations_resolved = true;
+            $this->locations          = GeoDirectoryLocations::available() ? new GeoDirectoryLocations( $this->post_type() ) : null;
+        }
+        return $this->locations;
     }
 
     /**

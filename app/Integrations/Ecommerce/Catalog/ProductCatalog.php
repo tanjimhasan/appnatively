@@ -6,6 +6,7 @@ defined( "ABSPATH" ) || exit;
 
 use Crafium\AppNatively\App\Filtering\Catalog;
 use Crafium\AppNatively\App\Filtering\RangeFacet;
+use Crafium\AppNatively\App\Filtering\TermSource;
 
 /**
  * Where one ecommerce plugin keeps what the product list and filter read: its
@@ -14,6 +15,9 @@ use Crafium\AppNatively\App\Filtering\RangeFacet;
  * flags) and a list's `in_stock` setting to CatalogQuery.
  */
 abstract class ProductCatalog extends Catalog {
+    /** @var array<string, TermSource>|null Memoized (see term_facets()). */
+    private ?array $term_facets = null;
+
     /**
      * The products' post type.
      */
@@ -94,13 +98,20 @@ abstract class ProductCatalog extends Catalog {
         return [ $this->post_type() ];
     }
 
+    /**
+     * Memoized: CatalogQuery asks for the facets once per narrowing, which is many
+     * times per request.
+     */
     public function term_facets(): array {
-        return array_filter(
-            [
-                'category' => $this->category_taxonomy(),
-                'tag'      => $this->tag_taxonomy(),
-            ]
-        );
+        if ( $this->term_facets === null ) {
+            $this->term_facets = $this->taxonomy_facets(
+                [
+                    'category' => $this->category_taxonomy(),
+                    'tag'      => $this->tag_taxonomy(),
+                ]
+            );
+        }
+        return $this->term_facets;
     }
 
     public function taxonomy_groups(): array {

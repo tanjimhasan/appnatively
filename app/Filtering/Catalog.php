@@ -25,12 +25,28 @@ abstract class Catalog {
     abstract public function post_types(): array;
 
     /**
-     * Term facets by id (`category`, `tag`, `location`) => taxonomy. The same taxonomies
-     * narrow a page's context through `categories[]`, `tags[]` and `locations[]`.
+     * Term facets by id (`category`, `tag`, `location`) => where its terms come from.
+     * The same sources narrow a page's context through `categories[]`, `tags[]` and
+     * `locations[]`. Usually taxonomies (see taxonomy_facets()), but a plugin that
+     * keeps its terms another way describes them with its own TermSource.
      *
-     * @return array<string, string>
+     * @return array<string, TermSource>
      */
     abstract public function term_facets(): array;
+
+    /**
+     * Term facets from taxonomy names, leaving out the ones this plugin doesn't have.
+     *
+     * @param array<string, string|null> $taxonomies Facet id => taxonomy.
+     * @return array<string, TermSource>
+     */
+    protected function taxonomy_facets( array $taxonomies ): array {
+        $facets = [];
+        foreach ( array_filter( $taxonomies ) as $facet_id => $taxonomy ) {
+            $facets[ $facet_id ] = new TaxonomyTermSource( (string) $taxonomy );
+        }
+        return $facets;
+    }
 
     /**
      * Other filterable taxonomies by facet prefix: `taxonomy` (brands, regions and the

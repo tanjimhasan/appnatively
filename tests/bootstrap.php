@@ -303,6 +303,9 @@ function _manually_load_plugin() {
     unset( $_ninjaforms_path );
 
     $load_plugin( 'directorist/directorist-base.php' );
+    // GeoDirectory fires `geodirectory_loaded` while being required, and that is what boots
+    // its Location Manager add-on, so the add-on has to register its hook first.
+    $load_plugin( 'geodir_location_manager/geodir_location_manager.php' );
     $load_plugin( 'geodirectory/geodirectory.php' );
     if ( defined( 'GEODIRECTORY_PLUGIN_DIR' )
         && ! class_exists( 'GeoDir_Admin_Install' )
@@ -313,6 +316,22 @@ function _manually_load_plugin() {
     if ( class_exists( 'GeoDir_Admin_Install' ) ) {
         GeoDir_Admin_Install::create_tables();
     }
+    // Creating the location tables is only reachable through install(), which needs
+    // $geodirectory->location: built on `init` priority 0.
+    add_action(
+        'init',
+        function (): void {
+            if ( class_exists( 'GeoDir_Location_Admin_Install' ) ) {
+                GeoDir_Location_Admin_Install::install();
+            }
+        },
+        20
+    );
+    // HivePress keeps no location data of its own: the `hp_listing_region` taxonomy comes
+    // from its Geolocation extension, and only while this option is on. A `pre_option_`
+    // filter rather than an option row, so it is in force before `init` registers it.
+    add_filter( 'pre_option_hp_geolocation_generate_regions', fn() => '1' );
+    $load_plugin( 'hivepress-geolocation/hivepress-geolocation.php' );
     $load_plugin( 'hivepress/hivepress.php' );
     $load_plugin( 'business-directory-plugin/business-directory-plugin.php' );
     $load_plugin( 'classified-listing/classified-listing.php' );

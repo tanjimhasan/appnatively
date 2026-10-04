@@ -269,7 +269,7 @@ class HivePress extends Provider {
         return new CategoryPaginatorDTO( $page, $per_page, $terms["total"], $terms["last_page"], $items );
     }
 
-    private function get_terms_page( string $taxonomy, Request $request, int $page, int $per_page ): array {
+    private function get_terms_page( string $taxonomy, Request $request, int $page, int $per_page, bool $pad_counts = false ): array {
         $sort  = sanitize_text_field( (string) $request->get_param( "sort" ) );
         $desc  = 0 === strpos( $sort, "-" );
         $key   = $desc ? ltrim( $sort, "-" ) : $sort;
@@ -297,12 +297,82 @@ class HivePress extends Provider {
         if ( is_wp_error( $total ) ) {
             $total = 0;
         }
+        if ( $pad_counts ) {
+            $items = $this->pad_term_counts( $items, $taxonomy );
+        }
 
         return [
             "items"     => $items,
             "total"     => (int) $total,
             "last_page" => max( 1, (int) ceil( (int) $total / $per_page ) ),
         ];
+    }
+
+    /**
+     * Each term's own count plus its descendants'. The Geolocation extension assigns a
+     * listing only its deepest region, so every region above it counts none of its own,
+     * while the `location` facet counts a parent together with its children
+     * (TaxonomyTermSource::options()) — both surfaces describe the same terms, so they
+     * have to agree.
+     *
+     * One read for the whole page, however deep the tree: the hierarchy itself comes
+     * from the term cache. A listing held by both a term and one of its descendants
+     * would be counted twice, which HivePress never stores; the facet's
+     * COUNT(DISTINCT) is the exact number where exactness matters.
+     *
+     * @param array $items Terms of this page.
+     * @return array
+     */
+    private function pad_term_counts( array $items, string $taxonomy ): array {
+        if ( empty( $items ) || ! is_taxonomy_hierarchical( $taxonomy ) ) {
+            return $items;
+        }
+
+        $children = [];
+        $wanted   = [];
+        foreach ( $items as $term ) {
+            $ids = get_term_children( (int) $term->term_id, $taxonomy );
+            if ( is_wp_error( $ids ) || empty( $ids ) ) {
+                continue;
+            }
+            $children[(int) $term->term_id] = array_map( "intval", $ids );
+            $wanted                         = array_merge( $wanted, $children[(int) $term->term_id] );
+        }
+        if ( empty( $wanted ) ) {
+            return $items;
+        }
+
+        $descendants = get_terms(
+            [
+                "taxonomy"   => $taxonomy,
+                "include"    => array_values( array_unique( $wanted ) ),
+                "hide_empty" => false,
+            ]
+        );
+        if ( is_wp_error( $descendants ) ) {
+            return $items;
+        }
+
+        $counts = [];
+        foreach ( (array) $descendants as $descendant ) {
+            $counts[(int) $descendant->term_id] = (int) $descendant->count;
+        }
+
+        $padded = [];
+        foreach ( $items as $term ) {
+            $sum = 0;
+            foreach ( $children[(int) $term->term_id] ?? [] as $child_id ) {
+                $sum += (int) ( $counts[$child_id] ?? 0 );
+            }
+            if ( $sum > 0 ) {
+                // A term object is shared through the term cache, so pad a copy of it.
+                $term        = clone $term;
+                $term->count = (int) $term->count + $sum;
+            }
+            $padded[] = $term;
+        }
+
+        return $padded;
     }
 
     private function map_category_to_dto( $term, array $fields ): CategoryDTO {
@@ -530,7 +600,7 @@ class HivePress extends Provider {
     private function query_terms( string $taxonomy, Request $request, array $fields ): TermPaginatorDTO {
         $page     = (int) $request->get_param( "page" ) ?: 1;
         $per_page = (int) $request->get_param( "per_page" ) ?: 10;
-        $terms    = $this->get_terms_page( $taxonomy, $request, $page, $per_page );
+        $terms    = $this->get_terms_page( $taxonomy, $request, $page, $per_page, true );
         $items    = [];
 
         foreach ( $terms["items"] as $term ) {

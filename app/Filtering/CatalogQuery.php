@@ -30,6 +30,10 @@ use Crafium\AppNatively\WpMVC\Database\Query\Builder;
  * flags (`availability`, `status`), `meta:<key>` (ACF and allowed meta) and
  * `field:<key>` (the plugin's own fields). Term and field values are OR-ed
  * within a facet, flags are AND-ed, and facets are AND-ed.
+ *
+ * A term facet is backed by a TermSource, which need not be a taxonomy: it
+ * narrows by term id for the page context and by slug for the selection, and
+ * mints the option values itself.
  */
 class CatalogQuery {
     /** Facets computed per filters request at most. */
@@ -52,7 +56,7 @@ class CatalogQuery {
     /** ACF field types that make sense as a filter. */
     private const ACF_FILTERABLE_TYPES = [ 'text', 'number', 'range', 'select', 'checkbox', 'radio', 'button_group', 'true_false' ];
 
-    /** Context params narrowing by terms => the term facet whose taxonomy they use. */
+    /** Context params narrowing by terms => the term facet they narrow by. */
     private const CONTEXT_TERM_PARAMS = [
         'categories' => 'category',
         'tags'       => 'tag',
@@ -127,8 +131,8 @@ class CatalogQuery {
      *
      * Cached in the object cache; a context without search text, a selection or a location
      * (what a filter opens with) is also kept as a transient, so the number of transients
-     * stays bounded by the site's terms. Time-dependent facets (open now) are cached for a
-     * minute and never as a transient.
+     * stays bounded by the site's terms and locations. Time-dependent facets (open now) are
+     * cached for a minute and never as a transient.
      *
      * @param WP_REST_Request $request
      * @return FiltersDTO
@@ -419,10 +423,10 @@ class CatalogQuery {
         $term_facets = $this->catalog->term_facets();
 
         foreach ( self::CONTEXT_TERM_PARAMS as $param => $facet_id ) {
-            $ids      = $this->positive_ids( $request->get_param( $param ) );
-            $taxonomy = $term_facets[ $facet_id ] ?? null;
-            if ( ! empty( $ids ) && $taxonomy ) {
-                $this->where_has_terms( $query, $taxonomy, $this->with_descendants( $ids, $taxonomy ) );
+            $ids    = $this->positive_ids( $request->get_param( $param ) );
+            $source = $term_facets[ $facet_id ] ?? null;
+            if ( ! empty( $ids ) && $source ) {
+                $source->where_ids( $query, $ids );
             }
         }
 
@@ -471,9 +475,9 @@ class CatalogQuery {
             return;
         }
 
-        $taxonomy = $this->term_facet_taxonomy( $facet_id );
-        if ( $taxonomy ) {
-            $this->where_term_slugs( $query, $taxonomy, $values );
+        $source = $this->term_source( $facet_id );
+        if ( $source ) {
+            $source->where_slugs( $query, $values );
             return;
         }
 
@@ -552,9 +556,9 @@ class CatalogQuery {
     }
 
     /**
-     * The taxonomy behind a term facet id, or null when it names none this catalog allows.
+     * Where a term facet id's terms come from, or null when it names none this catalog allows.
      */
-    private function term_facet_taxonomy( string $facet_id ): ?string {
+    private function term_source( string $facet_id ): ?TermSource {
         $term_facets = $this->catalog->term_facets();
         if ( isset( $term_facets[ $facet_id ] ) ) {
             return $term_facets[ $facet_id ];
@@ -565,7 +569,8 @@ class CatalogQuery {
         }
         $taxonomy = substr( $facet_id, $separator + 1 );
         $group    = $this->catalog->taxonomy_groups()[ substr( $facet_id, 0, $separator ) ] ?? [];
-        return isset( $group[ $taxonomy ] ) ? $taxonomy : null;
+        // The group names it, so its label comes from there rather than from the taxonomy.
+        return isset( $group[ $taxonomy ] ) ? new TaxonomyTermSource( $taxonomy, $group[ $taxonomy ] ) : null;
     }
 
     /**
@@ -579,65 +584,6 @@ class CatalogQuery {
             return $this->catalog->fields()[ substr( $facet_id, 6 ) ] ?? null;
         }
         return str_starts_with( $facet_id, 'meta:' ) ? $this->meta_field( substr( $facet_id, 5 ) ) : null;
-    }
-
-    /**
-     * Keep posts with any of the term slugs (and, in a hierarchical taxonomy, their children).
-     *
-     * @param string[] $slugs
-     */
-    private function where_term_slugs( Builder $query, string $taxonomy, array $slugs ): void {
-        $slugs    = array_values( array_filter( array_map( 'sanitize_title', $slugs ) ) );
-        $term_ids = empty( $slugs ) ? [] : get_terms(
-            [
-                'taxonomy'   => $taxonomy,
-                'slug'       => $slugs,
-                'fields'     => 'ids',
-                'hide_empty' => false,
-            ]
-        );
-
-        if ( is_wp_error( $term_ids ) || empty( $term_ids ) ) {
-            // The requested option(s) don't exist, so nothing can match.
-            $query->where( 'posts.ID', '=', 0 );
-            return;
-        }
-
-        $this->where_has_terms( $query, $taxonomy, $this->with_descendants( array_map( 'intval', $term_ids ), $taxonomy ) );
-    }
-
-    /**
-     * `$term_ids` plus their descendants, for a hierarchical taxonomy.
-     *
-     * @param int[] $term_ids
-     * @return int[]
-     */
-    private function with_descendants( array $term_ids, string $taxonomy ): array {
-        if ( ! is_taxonomy_hierarchical( $taxonomy ) ) {
-            return $term_ids;
-        }
-        $all = $term_ids;
-        foreach ( $term_ids as $term_id ) {
-            $children = get_term_children( $term_id, $taxonomy );
-            if ( ! is_wp_error( $children ) ) {
-                $all = array_merge( $all, array_map( 'intval', $children ) );
-            }
-        }
-        return array_values( array_unique( $all ) );
-    }
-
-    /**
-     * Keep posts that have any of `$term_ids` in `$taxonomy`.
-     *
-     * @param int[] $term_ids
-     */
-    private function where_has_terms( Builder $query, string $taxonomy, array $term_ids ): void {
-        $query->where_has(
-            'terms', function( $q ) use ( $taxonomy, $term_ids ) {
-                $q->where( 'taxonomy', $taxonomy )
-                    ->where_in( 'term_id', array_values( $term_ids ) );
-            }
-        );
     }
 
     /**
@@ -711,23 +657,13 @@ class CatalogQuery {
             return $this->build_flag_facet( $facet_id, $flag, $request );
         }
 
-        $taxonomy = $this->term_facet_taxonomy( $facet_id );
-        if ( $taxonomy ) {
-            return $this->build_term_facet( $facet_id, $taxonomy, $this->taxonomy_label( $taxonomy ), $request );
+        $source = $this->term_source( $facet_id );
+        if ( $source ) {
+            return $this->build_term_facet( $facet_id, $source, $request );
         }
 
         $field = $this->facet_field( $facet_id );
         return $field ? $this->build_field_facet( $facet_id, $field, $request ) : null;
-    }
-
-    private function taxonomy_label( string $taxonomy ): string {
-        foreach ( $this->catalog->taxonomy_groups() as $taxonomies ) {
-            if ( isset( $taxonomies[ $taxonomy ] ) ) {
-                return $taxonomies[ $taxonomy ];
-            }
-        }
-        $object = get_taxonomy( $taxonomy );
-        return $object ? (string) $object->labels->singular_name : $taxonomy;
     }
 
     private function build_range_facet( string $facet_id, RangeFacet $range, WP_REST_Request $request ): ?FacetDTO {
@@ -764,52 +700,12 @@ class CatalogQuery {
     }
 
     /**
-     * Options of one taxonomy with post counts. Its own selection is left out of the
+     * Options of one term source with post counts. Its own selection is left out of the
      * context, so counts show what adding another option would give (OR within a facet).
-     *
-     * In a hierarchical taxonomy, picking a term includes its children (see
-     * where_term_slugs()), so parent terms are listed even without posts of their
-     * own, and counted with their descendants.
      */
-    private function build_term_facet( string $facet_id, string $taxonomy, string $label, WP_REST_Request $request ): ?FacetDTO {
-        $rows = $this->context_query( $request, $facet_id )
-            ->join( 'term_relationships', 'posts.ID', '=', 'term_relationships.object_id' )
-            ->join( 'term_taxonomy', 'term_relationships.term_taxonomy_id', '=', 'term_taxonomy.term_taxonomy_id' )
-            ->join( 'terms', 'term_taxonomy.term_id', '=', 'terms.term_id' )
-            ->where( 'term_taxonomy.taxonomy', $taxonomy )
-            ->select( [ 'terms.term_id as term_id', 'terms.slug as value', 'terms.name as label', 'COUNT(DISTINCT posts.ID) as post_count' ] )
-            ->group_by( [ 'terms.term_id', 'terms.slug', 'terms.name' ] )
-            ->order_by( 'terms.name', 'asc' )
-            ->limit( self::MAX_FACET_OPTIONS )
-            ->get();
-
-        $terms = [];
-        foreach ( $rows as $row ) {
-            $terms[ (int) $row->term_id ] = [ (string) $row->value, (string) $row->label, (int) $row->post_count ];
-        }
-
-        if ( ! empty( $terms ) && is_taxonomy_hierarchical( $taxonomy ) ) {
-            $parents = [];
-            foreach ( array_keys( $terms ) as $term_id ) {
-                foreach ( get_ancestors( $term_id, $taxonomy, 'taxonomy' ) as $ancestor_id ) {
-                    $parents[ (int) $ancestor_id ] = true;
-                }
-                $children = get_term_children( $term_id, $taxonomy );
-                if ( ! is_wp_error( $children ) && ! empty( $children ) ) {
-                    $parents[ $term_id ] = true;
-                }
-            }
-            foreach ( array_keys( $parents ) as $parent_id ) {
-                $term = get_term( $parent_id, $taxonomy );
-                if ( ! $term || is_wp_error( $term ) ) {
-                    continue;
-                }
-                $query = $this->context_query( $request, $facet_id );
-                $this->where_has_terms( $query, $taxonomy, $this->with_descendants( [ $parent_id ], $taxonomy ) );
-                $terms[ $parent_id ] = [ (string) $term->slug, (string) $term->name, (int) $query->count() ];
-            }
-            uasort( $terms, fn( $a, $b ) => strcasecmp( $a[1], $b[1] ) );
-        }
+    private function build_term_facet( string $facet_id, TermSource $source, WP_REST_Request $request ): ?FacetDTO {
+        // A factory, not one query: a source may need several, and each must be ungrouped.
+        $terms = $source->options( fn(): Builder => $this->context_query( $request, $facet_id ), self::MAX_FACET_OPTIONS );
 
         $options = [];
         foreach ( $terms as [ $value, $option_label, $count ] ) {
@@ -822,7 +718,7 @@ class CatalogQuery {
             return null;
         }
 
-        return ( new FacetDTO() )->set_id( $facet_id )->set_label( $label )
+        return ( new FacetDTO() )->set_id( $facet_id )->set_label( $source->label() )
             ->set_kind( FacetDTO::KIND_CHOICE )->set_options( array_slice( $options, 0, self::MAX_FACET_OPTIONS ) );
     }
 

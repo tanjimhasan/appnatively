@@ -6,6 +6,8 @@ defined( "ABSPATH" ) || exit;
 
 use Crafium\AppNatively\App\Filtering\Catalog;
 use Crafium\AppNatively\App\Filtering\RangeFacet;
+use Crafium\AppNatively\App\Filtering\TaxonomyTermSource;
+use Crafium\AppNatively\App\Filtering\TermSource;
 
 /**
  * Where one directory plugin keeps what the listing list and filter read: its
@@ -17,6 +19,9 @@ use Crafium\AppNatively\App\Filtering\RangeFacet;
 abstract class ListingCatalog extends Catalog {
     /** Seconds the ids of open listings are reused for. */
     private const OPEN_NOW_CACHE_TTL = MINUTE_IN_SECONDS;
+
+    /** @var array<string, TermSource>|null Memoized (see term_facets()). */
+    private ?array $term_facets = null;
 
     /**
      * The taxonomy behind the `category` facet and a page's `categories[]`.
@@ -35,6 +40,16 @@ abstract class ListingCatalog extends Catalog {
      */
     public function location_taxonomy(): ?string {
         return null;
+    }
+
+    /**
+     * Where the `location` facet's terms come from. Most plugins keep locations in a
+     * taxonomy, so this follows location_taxonomy(); one that stores them its own way
+     * (GeoDirectory) overrides this instead.
+     */
+    public function location_source(): ?TermSource {
+        $taxonomy = $this->location_taxonomy();
+        return $taxonomy ? new TaxonomyTermSource( $taxonomy ) : null;
     }
 
     /**
@@ -97,18 +112,35 @@ abstract class ListingCatalog extends Catalog {
         return [];
     }
 
+    /**
+     * Memoized: CatalogQuery asks for the facets once per narrowing, which is many
+     * times per request, and a source may hold per-request lookups of its own.
+     */
     public function term_facets(): array {
-        return array_filter(
-            [
-                'category' => $this->category_taxonomy(),
-                'tag'      => $this->tag_taxonomy(),
-                'location' => $this->location_taxonomy(),
-            ]
-        );
+        if ( $this->term_facets === null ) {
+            $this->term_facets = $this->taxonomy_facets(
+                [
+                    'category' => $this->category_taxonomy(),
+                    'tag'      => $this->tag_taxonomy(),
+                ]
+            );
+            $location          = $this->location_source();
+            if ( $location ) {
+                $this->term_facets['location'] = $location;
+            }
+        }
+        return $this->term_facets;
     }
 
+    /**
+     * A taxonomy that already backs a term facet is left out: offered as a
+     * `taxonomy:` facet too it would be two filter rows over one set of terms
+     * (HivePress's `hp_listing_region` is both its `region` attribute and its
+     * location taxonomy).
+     */
     public function taxonomy_groups(): array {
-        return [ 'taxonomy' => $this->extra_taxonomies() ];
+        $reserved = array_filter( [ $this->category_taxonomy(), $this->tag_taxonomy(), $this->location_taxonomy() ] );
+        return [ 'taxonomy' => array_diff_key( $this->extra_taxonomies(), array_flip( $reserved ) ) ];
     }
 
     public function search_columns(): array {
