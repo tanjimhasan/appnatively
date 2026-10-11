@@ -18,11 +18,8 @@ use Crafium\AppNatively\WpMVC\RequestValidator\Request;
  * Answers the "is AppNatively installed and reachable here?" handshake that
  * Studio performs before the site owner supplies a connection key.
  *
- * Deliberately says nothing about the site's configuration: no plugin list, no
- * user data, no settings, and no version. Anything that describes the site —
- * including which release of this plugin is installed, which is what someone
- * scanning for sites on a known-vulnerable version is looking for — sits behind
- * the connection key instead, on the /plugins endpoint.
+ * Reports the plugin version and supported connection protocol, without
+ * exposing the site's integration list, user data or settings.
  */
 class ConnectionController extends Controller {
     /**
@@ -34,9 +31,12 @@ class ConnectionController extends Controller {
     public function index( Request $request ): array {
         return Response::send(
             [
-                "connected" => true,
-                "name"      => "AppNatively",
-                "version"   => craf_appna_version(),
+                "connected"    => true,
+                "name"         => "AppNatively",
+                "version"      => craf_appna_version(),
+                "capabilities" => [
+                    "bearerConnectionKey" => true,
+                ],
             ]
         );
     }

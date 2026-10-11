@@ -39,7 +39,18 @@ class EnsureIsConnectedApp implements Middleware {
             return Settings::api_disabled_error();
         }
 
-        $key = $wp_rest_request->get_header( 'X-AppNatively-Key' );
+        $authorization = $wp_rest_request->get_header( 'Authorization' );
+        $key           = null;
+
+        // An explicit Authorization header takes precedence, even if invalid.
+        // Never silently downgrade a rejected bearer credential to the legacy key.
+        if ( null !== $authorization ) {
+            if ( preg_match( '/\A[ \t]*Bearer[ \t]+([^\s,]+)[ \t]*\z/i', $authorization, $matches ) ) {
+                $key = $matches[1];
+            }
+        } else {
+            $key = $wp_rest_request->get_header( 'X-AppNatively-Key' );
+        }
 
         if ( ! Settings::verify_site_key( $key ) ) {
             return new WP_Error(

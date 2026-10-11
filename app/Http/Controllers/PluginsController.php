@@ -52,10 +52,8 @@ class PluginsController extends Controller {
             }
         }
 
-        // Reported here rather than on the unauthenticated handshake: the
-        // installed version is exactly what a scan looking for sites running a
-        // known-vulnerable release wants, and Studio already holds the key by
-        // the time it needs to know.
+        // Include the version here too so Studio can verify its connection key
+        // while checking the installed release.
         return Response::send(
             [
                 "plugins" => $activated_plugins,

@@ -8,7 +8,7 @@ use Crafium\AppNatively\Database\Setup;
 /**
  * Plugin Name:       AppNatively
  * Description:       Turn your WordPress site into a native iOS and Android mobile app. Seamlessly sync WooCommerce, FluentCart.
- * Version:           0.0.8
+ * Version:           0.0.9
  * Requires at least: 6.5
  * Requires PHP:      7.4
  * Author:            Crafium

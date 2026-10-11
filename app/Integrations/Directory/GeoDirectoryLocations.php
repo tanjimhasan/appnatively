@@ -6,6 +6,8 @@ defined( "ABSPATH" ) || exit;
 
 use Crafium\AppNatively\App\Filtering\TermSource;
 use Crafium\AppNatively\WpMVC\Database\Query\Builder;
+use Crafium\AppNatively\WpMVC\Database\Query\JoinClause;
+use Crafium\AppNatively\WpMVC\Database\Schema\Schema;
 
 /**
  * GeoDirectory's locations, which its Location Manager add-on keeps in
@@ -31,6 +33,9 @@ final class GeoDirectoryLocations implements TermSource {
     /** Locations resolved in one statement at most. */
     private const MAX_RESOLVED = 200;
 
+    /** The columns a city row carries, under the locations table's alias. */
+    private const CITY_COLUMNS = [ 'l.location_id', 'l.country', 'l.region', 'l.city', 'l.city_slug', 'l.country_slug', 'l.region_slug' ];
+
     /** The listing post type locations are counted for. */
     private string $post_type;
 
@@ -55,9 +60,7 @@ final class GeoDirectoryLocations implements TermSource {
         }
 
         if ( $available === null ) {
-            global $wpdb;
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema lookup, memoized.
-            $available = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', GEODIR_LOCATIONS_TABLE ) ) === GEODIR_LOCATIONS_TABLE;
+            $available = Schema::has_table( self::table_name( GEODIR_LOCATIONS_TABLE ) );
         }
 
         return $available;
@@ -133,43 +136,58 @@ final class GeoDirectoryLocations implements TermSource {
      * @return array{items: object[], total: int}
      */
     public function page( string $search, string $sort, int $per_page, int $offset ): array {
-        global $wpdb;
-
         [ $order_by, $order ] = $this->order( $sort );
 
-        $locations  = GEODIR_LOCATIONS_TABLE;
-        $detail     = $this->detail_table();
-        $search_sql = '';
-        $bindings   = [ $this->post_type ];
-
-        if ( '' !== $search ) {
-            $search_sql = ' AND l.city LIKE %s';
-            $bindings[] = '%' . $wpdb->esc_like( $search ) . '%';
-        }
-        $bindings[] = $per_page;
-        $bindings[] = $offset;
-
-        $sql = "SELECT l.location_id, l.country, l.region, l.city, l.city_slug, l.country_slug, l.region_slug, COUNT(DISTINCT p.ID) AS post_count
-            FROM {$locations} l
-            LEFT JOIN {$detail} d ON d.country = l.country AND d.region = l.region AND d.city = l.city
-            LEFT JOIN {$wpdb->posts} p ON p.ID = d.post_id AND p.post_type = %s AND p.post_status = 'publish' AND p.post_password = ''
-            WHERE l.city <> ''{$search_sql}
-            GROUP BY l.location_id, l.country, l.region, l.city, l.city_slug, l.country_slug, l.region_slug
-            ORDER BY {$order_by} {$order}, l.location_id ASC
-            LIMIT %d OFFSET %d";
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- one paged read of trusted table names and a whitelisted order; every value is a placeholder.
-        $items = (array) $wpdb->get_results( $wpdb->prepare( $sql, $bindings ) );
-
-        $total_sql = "SELECT COUNT(*) FROM {$locations} l WHERE l.city <> ''{$search_sql}";
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- the same count, with the search term prepared.
-        $total = '' === $search ? $wpdb->get_var( $total_sql ) : $wpdb->get_var( $wpdb->prepare( $total_sql, '%' . $wpdb->esc_like( $search ) . '%' ) );
+        // A city's listings are counted through its name tuple, and over published posts
+        // only, which is why both joins are LEFT: a city with none still has a row, with a
+        // count of 0.
+        $items = $this->named_cities( $search )
+            ->add_select( [ 'COUNT(DISTINCT p.ID) as post_count' ] )
+            ->left_join(
+                $this->detail_table() . ' as d',
+                function ( JoinClause $join ): void {
+                    $join->on_column( 'd.country', '=', 'l.country' )
+                        ->on_column( 'd.region', '=', 'l.region' )
+                        ->on_column( 'd.city', '=', 'l.city' );
+                }
+            )
+            ->left_join(
+                'posts as p',
+                function ( JoinClause $join ): void {
+                    // Literal conditions only: a value bound inside an ON clause never
+                    // reaches the statement the builder prepares. None is needed for the
+                    // post type either — a detail table holds that one post type.
+                    $join->on_column( 'p.ID', '=', 'd.post_id' )
+                        ->on_raw( "p.post_status = 'publish' AND p.post_password = ''" );
+                }
+            )
+            ->group_by( self::CITY_COLUMNS )
+            ->order_by( $order_by, $order )
+            ->order_by( 'l.location_id', 'asc' )
+            ->limit( $per_page )
+            ->offset( $offset )
+            ->get()
+            ->all();
 
         return [
             'items' => $items,
-            'total' => (int) $total,
+            'total' => $this->named_cities( $search )->count(),
         ];
+    }
+
+    /**
+     * The cities the locations endpoint lists: the named ones, narrowed by its search term.
+     */
+    private function named_cities( string $search ): Builder {
+        $query = $this->cities_query()->where( 'l.city', '<>', '' );
+
+        if ( '' !== $search ) {
+            global $wpdb;
+            // The builder binds the term; the wildcards in the term itself still need escaping.
+            $query->where_like( 'l.city', '%' . $wpdb->esc_like( $search ) . '%' );
+        }
+
+        return $query;
     }
 
     /**
@@ -184,16 +202,12 @@ final class GeoDirectoryLocations implements TermSource {
      * How many listings a city has.
      */
     public function count_for( object $city ): int {
-        global $wpdb;
-
-        $detail = $this->detail_table();
-        $sql    = "SELECT COUNT(DISTINCT p.ID) FROM {$detail} d
-            INNER JOIN {$wpdb->posts} p ON p.ID = d.post_id
-            WHERE d.country = %s AND d.region = %s AND d.city = %s
-            AND p.post_type = %s AND p.post_status = 'publish' AND p.post_password = ''";
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- one count over trusted table names; every value is a placeholder.
-        return (int) $wpdb->get_var( $wpdb->prepare( $sql, (string) $city->country, (string) $city->region, (string) $city->city, $this->post_type ) );
+        return $this->published_listings()
+            ->where( 'd.country', (string) $city->country )
+            ->where( 'd.region', (string) $city->region )
+            ->where( 'd.city', (string) $city->city )
+            ->distinct()
+            ->count( 'p.ID' );
     }
 
     /**
@@ -208,8 +222,6 @@ final class GeoDirectoryLocations implements TermSource {
      * @return array<int, string>
      */
     public function image_values( array $cities ): array {
-        global $wpdb;
-
         if ( ! defined( 'GEODIR_LOCATION_SEO_TABLE' ) || empty( $cities ) ) {
             return [];
         }
@@ -226,13 +238,13 @@ final class GeoDirectoryLocations implements TermSource {
         }
         $slugs = array_slice( array_keys( $slugs ), 0, self::MAX_RESOLVED );
 
-        $seo          = GEODIR_LOCATION_SEO_TABLE;
-        $placeholders = implode( ',', array_fill( 0, count( $slugs ), '%s' ) );
-        $sql          = "SELECT city_slug, country_slug, region_slug, image FROM {$seo}
-            WHERE location_type = 'city' AND city_slug IN ({$placeholders}) ORDER BY seo_id";
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- one bulk read of a trusted table name; the slugs are placeholders.
-        $rows = (array) $wpdb->get_results( $wpdb->prepare( $sql, $slugs ) );
+        $rows = GeoDirectoryRow::from_table( self::table_name( GEODIR_LOCATION_SEO_TABLE ), 's' )
+            ->select( [ 's.city_slug', 's.country_slug', 's.region_slug', 's.image' ] )
+            ->where( 's.location_type', 'city' )
+            ->where_in( 's.city_slug', $slugs )
+            ->order_by( 's.seo_id' )
+            ->get()
+            ->all();
 
         $exact   = [];
         $by_slug = [];
@@ -280,8 +292,6 @@ final class GeoDirectoryLocations implements TermSource {
      * @return array<int, int> Location id => listing id.
      */
     public function listing_ids( array $cities ): array {
-        global $wpdb;
-
         $wanted = [];
         foreach ( $cities as $city ) {
             $city_name = (string) ( $city->city ?? '' );
@@ -294,22 +304,12 @@ final class GeoDirectoryLocations implements TermSource {
         }
         $wanted = array_slice( $wanted, 0, self::MAX_RESOLVED, true );
 
-        $bindings = [ $this->post_type ];
-        foreach ( $wanted as [ $country, $region, $city_name ] ) {
-            array_push( $bindings, $country, $region, $city_name );
-        }
+        $query = $this->published_listings()
+            ->select( [ 'd.country', 'd.region', 'd.city', 'MAX(d.post_id) as post_id' ] )
+            ->group_by( [ 'd.country', 'd.region', 'd.city' ] );
+        $this->where_any_tuple( $query, 'd', array_values( $wanted ) );
 
-        $detail = $this->detail_table();
-        $tuples = implode( ' OR ', array_fill( 0, count( $wanted ), '(d.country = %s AND d.region = %s AND d.city = %s)' ) );
-        $sql    = "SELECT d.country, d.region, d.city, MAX(d.post_id) AS post_id
-            FROM {$detail} d
-            INNER JOIN {$wpdb->posts} p ON p.ID = d.post_id
-            WHERE p.post_type = %s AND p.post_status = 'publish' AND p.post_password = ''
-            AND ({$tuples})
-            GROUP BY d.country, d.region, d.city";
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- one grouped read of trusted table names; every value is a placeholder.
-        $rows = (array) $wpdb->get_results( $wpdb->prepare( $sql, $bindings ) );
+        $rows = $query->get()->all();
 
         $by_tuple = [];
         foreach ( $rows as $row ) {
@@ -342,20 +342,17 @@ final class GeoDirectoryLocations implements TermSource {
      * @param int[] $post_ids
      */
     public function prime( array $post_ids ): void {
-        global $wpdb;
-
         $post_ids = array_values( array_filter( array_map( 'intval', $post_ids ), fn( int $id ): bool => $id > 0 && ! array_key_exists( $id, $this->post_tuples ) ) );
         if ( empty( $post_ids ) ) {
             return;
         }
         $post_ids = array_slice( array_values( array_unique( $post_ids ) ), 0, self::MAX_RESOLVED );
 
-        $detail       = $this->detail_table();
-        $placeholders = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
-        $sql          = "SELECT post_id, country, region, city FROM {$detail} WHERE post_id IN ({$placeholders})";
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- one bulk read of a trusted table name, memoized per request; the ids are placeholders.
-        $rows = (array) $wpdb->get_results( $wpdb->prepare( $sql, $post_ids ) );
+        $rows = GeoDirectoryRow::from_table( $this->detail_table(), 'd' )
+            ->select( [ 'd.post_id', 'd.country', 'd.region', 'd.city' ] )
+            ->where_in( 'd.post_id', $post_ids )
+            ->get()
+            ->all();
 
         $tuples = [];
         foreach ( $rows as $row ) {
@@ -398,24 +395,43 @@ final class GeoDirectoryLocations implements TermSource {
      * @param object[] $rows
      */
     private function where_tuples( Builder $query, array $rows ): void {
-        $conditions = [];
-        $bindings   = [];
+        $tuples = [];
 
         foreach ( $rows as $row ) {
-            if ( '' === trim( (string) $row->city ) ) {
-                continue;
+            if ( '' !== trim( (string) $row->city ) ) {
+                $tuples[] = [ (string) $row->country, (string) $row->region, (string) $row->city ];
             }
-            $conditions[] = '(gd_detail.country = %s AND gd_detail.region = %s AND gd_detail.city = %s)';
-            array_push( $bindings, (string) $row->country, (string) $row->region, (string) $row->city );
         }
 
-        if ( empty( $conditions ) ) {
+        if ( empty( $tuples ) ) {
             // The requested location(s) don't exist, so nothing can match.
             $query->where( 'posts.ID', '=', 0 );
             return;
         }
 
-        $query->where_raw( '(' . implode( ' OR ', $conditions ) . ')', $bindings );
+        $this->where_any_tuple( $query, 'gd_detail', $tuples );
+    }
+
+    /**
+     * Keep the rows of `$alias` whose `country`, `region` and `city` are one of these
+     * tuples: one nested OR group, so the caller's other conditions still apply.
+     *
+     * @param array<int, array{0: string, 1: string, 2: string}> $tuples
+     */
+    private function where_any_tuple( Builder $query, string $alias, array $tuples ): void {
+        $query->where(
+            function ( Builder $group ) use ( $alias, $tuples ): void {
+                foreach ( $tuples as [ $country, $region, $city ] ) {
+                    $group->or_where(
+                        function ( Builder $tuple ) use ( $alias, $country, $region, $city ): void {
+                            $tuple->where( "{$alias}.country", $country )
+                                ->where( "{$alias}.region", $region )
+                                ->where( "{$alias}.city", $city );
+                        }
+                    );
+                }
+            }
+        );
     }
 
     /**
@@ -425,8 +441,6 @@ final class GeoDirectoryLocations implements TermSource {
      * @return object[]
      */
     private function rows_by_ids( array $ids ): array {
-        global $wpdb;
-
         $ids = array_values( array_filter( array_map( 'intval', $ids ), fn( int $id ): bool => $id > 0 ) );
         $ids = array_slice( array_values( array_unique( $ids ) ), 0, self::MAX_RESOLVED );
         if ( empty( $ids ) ) {
@@ -435,10 +449,7 @@ final class GeoDirectoryLocations implements TermSource {
 
         $key = 'id:' . implode( ',', $ids );
         if ( ! isset( $this->resolved[ $key ] ) ) {
-            $sql = $this->select_cities() . ' WHERE location_id IN (' . implode( ',', array_fill( 0, count( $ids ), '%d' ) ) . ') ORDER BY location_id';
-
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- bounded read of a trusted table name, memoized per request; the ids are placeholders.
-            $this->resolved[ $key ] = (array) $wpdb->get_results( $wpdb->prepare( $sql, $ids ) );
+            $this->resolved[ $key ] = $this->cities_query()->where_in( 'l.location_id', $ids )->order_by( 'l.location_id' )->get()->all();
             $this->remember( $this->resolved[ $key ] );
         }
 
@@ -453,8 +464,6 @@ final class GeoDirectoryLocations implements TermSource {
      * @return object[]
      */
     private function rows_by_slugs( array $slugs ): array {
-        global $wpdb;
-
         // Bound as stored, like a field's values: sanitize_title() could only turn a slug
         // GeoDirectory stored into one it never would, which would match nothing.
         $slugs = array_values( array_unique( array_filter( array_map( 'strval', $slugs ), fn( string $slug ): bool => '' !== $slug ) ) );
@@ -465,10 +474,7 @@ final class GeoDirectoryLocations implements TermSource {
 
         $key = 'slug:' . implode( ',', $slugs );
         if ( ! isset( $this->resolved[ $key ] ) ) {
-            $sql = $this->select_cities() . ' WHERE city_slug IN (' . implode( ',', array_fill( 0, count( $slugs ), '%s' ) ) . ') ORDER BY location_id';
-
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- bounded read of a trusted table name, memoized per request; the slugs are placeholders.
-            $this->resolved[ $key ] = (array) $wpdb->get_results( $wpdb->prepare( $sql, $slugs ) );
+            $this->resolved[ $key ] = $this->cities_query()->where_in( 'l.city_slug', $slugs )->order_by( 'l.location_id' )->get()->all();
             $this->remember( $this->resolved[ $key ] );
         }
 
@@ -483,8 +489,6 @@ final class GeoDirectoryLocations implements TermSource {
      * @return array<string, object>
      */
     private function resolve_tuples( array $tuples ): array {
-        global $wpdb;
-
         $wanted = [];
         foreach ( $tuples as [ $country, $region, $city ] ) {
             $key = $this->tuple_key( $country, $region, $city );
@@ -494,16 +498,11 @@ final class GeoDirectoryLocations implements TermSource {
         }
 
         if ( ! empty( $wanted ) ) {
-            $wanted   = array_slice( $wanted, 0, self::MAX_RESOLVED, true );
-            $bindings = [];
-            foreach ( $wanted as [ $country, $region, $city ] ) {
-                array_push( $bindings, $country, $region, $city );
-            }
+            $wanted = array_slice( $wanted, 0, self::MAX_RESOLVED, true );
 
-            $sql = $this->select_cities() . ' WHERE (country, region, city) IN (' . implode( ',', array_fill( 0, count( $wanted ), '(%s,%s,%s)' ) ) . ') ORDER BY location_id';
-
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders -- one bulk read of a trusted table name, memoized per request; the names are placeholders.
-            $rows = (array) $wpdb->get_results( $wpdb->prepare( $sql, $bindings ) );
+            $query = $this->cities_query();
+            $this->where_any_tuple( $query, 'l', array_values( $wanted ) );
+            $rows = $query->order_by( 'l.location_id' )->get()->all();
 
             // Remember the misses too: an unknown tuple is never looked up twice.
             foreach ( array_keys( $wanted ) as $key ) {
@@ -572,19 +571,37 @@ final class GeoDirectoryLocations implements TermSource {
     }
 
     /**
-     * The SELECT every city lookup starts from. A trusted, constant string: the caller's
-     * own WHERE carries the placeholders.
+     * The query every city lookup starts from: the locations table, as `l`.
      */
-    private function select_cities(): string {
-        return 'SELECT location_id, country, region, city, city_slug, country_slug, region_slug FROM ' . GEODIR_LOCATIONS_TABLE;
+    private function cities_query(): Builder {
+        return GeoDirectoryRow::from_table( self::table_name( GEODIR_LOCATIONS_TABLE ), 'l' )->select( self::CITY_COLUMNS );
     }
 
     /**
-     * The listing detail table, with the site prefix (these are direct reads, not the
-     * query builder's joins, which add it themselves).
+     * The detail rows of published listings: the detail table as `d`, with its posts as `p`.
+     */
+    private function published_listings(): Builder {
+        return GeoDirectoryRow::from_table( $this->detail_table(), 'd' )
+            ->join( 'posts as p', 'p.ID', '=', 'd.post_id' )
+            ->where( 'p.post_type', $this->post_type )
+            ->where( 'p.post_status', 'publish' )
+            ->where( 'p.post_password', '' );
+    }
+
+    /**
+     * The listing detail table.
      */
     private function detail_table(): string {
+        return 'geodir_' . $this->post_type . '_detail';
+    }
+
+    /**
+     * A table's name without the site prefix, which the builder's resolver adds back.
+     * Location Manager's constants carry GeoDirectory's own `$wpdb->prefix . 'geodir_'`,
+     * so the prefix comes off rather than the name being spelled out a second time here.
+     */
+    private static function table_name( string $table ): string {
         global $wpdb;
-        return $wpdb->prefix . 'geodir_' . $this->post_type . '_detail';
+        return 0 === strpos( $table, $wpdb->prefix ) ? substr( $table, strlen( $wpdb->prefix ) ) : $table;
     }
 }
